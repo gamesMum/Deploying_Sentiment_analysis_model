@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 import torch.optim as optim
 import torch.utils.data
+import numpy as np
 
 from model import LSTMClassifier
 
@@ -25,8 +26,7 @@ def model_fn(model_dir):
 
     # Determine the device and construct the model.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LSTMClassifier(model_info['embedding_dim'], model_info['hidden_dim'], model_info['vocab_size'])
-
+    model = LSTMClassifier(model_info['embedding_dim'], model_info['hidden_dim'], model_info['vocab_size'])                     
     # Load the stored model parameters.
     model_path = os.path.join(model_dir, 'model.pth')
     with open(model_path, 'rb') as f:
@@ -54,8 +54,19 @@ def _get_train_data_loader(batch_size, training_dir):
 
     return torch.utils.data.DataLoader(train_ds, batch_size=batch_size)
 
+def _get_valid_data_loader(batch_size, validation_dir):
+    print("Get validation data loader.")
 
-def train(model, train_loader, epochs, optimizer, loss_fn, device):
+    valid_data = pd.read_csv(os.path.join(validation_dir, "validation.csv"), header=None, names=None)
+
+    valid_y = torch.from_numpy(valid_data[[0]].values).float().squeeze()
+    valid_X = torch.from_numpy(valid_data.drop([0], axis=1).values).long()
+
+    valid_ds = torch.utils.data.TensorDataset(valid_X, valid_y)
+
+    return torch.utils.data.DataLoader(valid_ds, batch_size=batch_size)
+
+def train(model, train_loader, valid_loader, early_stopping, epochs, optimizer, loss_fn, device):
     """
     This is the training method that is called by the PyTorch training script. The parameters
     passed are as follows:
@@ -65,12 +76,76 @@ def train(model, train_loader, epochs, optimizer, loss_fn, device):
     optimizer    - The optimizer to use during training.
     loss_fn      - The loss function used for training.
     device       - Where the model and data should be loaded (gpu or cpu).
-    """
-    
+    """    
     # TODO: Paste the train() method developed in the notebook here.
+    bad_round = 0
+    val_loss_min = np.Inf
+    val_loss_last = np.Inf
+    
+    best_model = model
+    
+    for epoch in range(1, epochs + 1):
+        if bad_round == early_stopping:
+            print("Early stopping after {} bad rounds\nBest validation loss: {}".format(early_stopping, val_loss_min))
+            break
+            
+        model.train()
+        total_loss = 0
+        total_val_loss = 0
+        
+        for batch in train_loader:         
+            batch_X, batch_y = batch
+            
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+            
+            # TODO: Complete this train method to train the model provided.init_hidden
+            # Zero accumulated gradients
+            model.zero_grad()
+            
+            # Get the outoput
+            output= model(batch_X)
+            
+            # Calculate the loss and perform backprob
+            loss = loss_fn(output, batch_y)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.data.item()
+        train_loss = total_loss / len(train_loader) 
+  
+        # Check validation loss
+        model.eval()
+        for batch in valid_loader:
+            batch_X, batch_y = batch
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+           
+            #Get the output
+            output = model(batch_X)
+            val_loss = loss_fn(output, batch_y)
+            # Add up validation losses for each batch
+            total_val_loss += val_loss.data.item()
+            
+        # Calculate average loss
+        val_loss = total_val_loss / len(valid_loader)
+        
+        # Checking validation loss status
+        if val_loss <= val_loss_min:
+            val_loss_min = val_loss
+            best_model = model
 
-    pass
-
+        if val_loss <= val_loss_last:
+            # reset bad round count
+            bad_round = 0
+        else:
+            bad_round += 1
+            
+        val_loss_last = val_loss
+                
+        print("Epoch: {}, BCELoss: {}, ValidLoss: {}\nBest validation loss: {}".format(epoch, train_loss, val_loss, val_loss_min)) 
+        model = best_model
+            
 
 if __name__ == '__main__':
     # All of the model parameters and training parameters are sent as arguments when the script
@@ -85,14 +160,25 @@ if __name__ == '__main__':
                         help='number of epochs to train (default: 10)')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
+    
+    parser.add_argument('--lr', type=float, default=0.001, metavar='L',
+                        help='learning rate (default: 0.001)')
+    
+    parser.add_argument('--early_stopping', type=int, default=10, metavar='N',
+                        help='number of epochs to stop if no enhancing in validation loss (default: 10)')
 
     # Model Parameters
     parser.add_argument('--embedding_dim', type=int, default=32, metavar='N',
                         help='size of the word embeddings (default: 32)')
     parser.add_argument('--hidden_dim', type=int, default=100, metavar='N',
                         help='size of the hidden dimension (default: 100)')
+    
     parser.add_argument('--vocab_size', type=int, default=5000, metavar='N',
                         help='size of the vocabulary (default: 5000)')
+    
+    #parser.add_argument('--drop_out', type=float, default=0.2, metavar='N',
+                        #help='dropout probability (default: 0.2)')
+    
 
     # SageMaker Parameters
     parser.add_argument('--hosts', type=list, default=json.loads(os.environ['SM_HOSTS']))
@@ -110,7 +196,10 @@ if __name__ == '__main__':
 
     # Load the training data.
     train_loader = _get_train_data_loader(args.batch_size, args.data_dir)
-
+    
+    # load the validation data
+    valid_loader = _get_valid_data_loader(args.batch_size, args.data_dir)
+    
     # Build the model.
     model = LSTMClassifier(args.embedding_dim, args.hidden_dim, args.vocab_size).to(device)
 
@@ -122,10 +211,10 @@ if __name__ == '__main__':
     ))
 
     # Train the model.
-    optimizer = optim.Adam(model.parameters())
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = torch.nn.BCELoss()
 
-    train(model, train_loader, args.epochs, optimizer, loss_fn, device)
+    train(model, train_loader, valid_loader, args.early_stopping, args.epochs, optimizer, loss_fn, device)
 
     # Save the parameters used to construct the model
     model_info_path = os.path.join(args.model_dir, 'model_info.pth')
@@ -133,7 +222,7 @@ if __name__ == '__main__':
         model_info = {
             'embedding_dim': args.embedding_dim,
             'hidden_dim': args.hidden_dim,
-            'vocab_size': args.vocab_size,
+            'vocab_size': args.vocab_size
         }
         torch.save(model_info, f)
 
